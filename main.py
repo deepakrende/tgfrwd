@@ -384,7 +384,7 @@ async def init_db(pool):
 
         await conn.execute(schema)
 
-        for account_no in range(1, 4):
+        for account_no in range(1, 6):
 
             await conn.execute(
                 """
@@ -1482,7 +1482,7 @@ async def status_loop(pool):
             # Account cooldown status
             # ------------------------------------------------
 
-            for account_no in range(1, 4):
+            for account_no in range(1, 6):
 
                 cooldown = await get_cooldown(
                     pool,
