@@ -1,0 +1,41 @@
+services:
+  - type: worker
+    name: telegram-forwarder
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SOURCE_CHANNEL
+        sync: false
+      - key: DESTINATION_CHANNEL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: SESSION_1
+        sync: false
+      - key: SESSION_2
+        sync: false
+      - key: SESSION_3
+        sync: false
+      - key: SESSION_4
+        sync: false
+      - key: SESSION_5
+        sync: false
+      - key: WORKERS_PER_ACCOUNT
+        value: "1"
+      - key: QUEUE_BATCH_SIZE
+        value: "500"
+      - key: SCAN_BATCH_SIZE
+        value: "500"
+      - key: PROCESSING_LEASE_SECONDS
+        value: "1800"
+      - key: MAX_RETRIES
+        value: "5"
+      - key: RETRY_DELAY_SECONDS
+        value: "10"
+      - key: POLL_SECONDS
+        value: "15"
