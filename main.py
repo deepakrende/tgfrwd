@@ -63,7 +63,7 @@ POLL_SECONDS = int(
 
 SESSION_STRINGS = [
     os.getenv(f"SESSION_{i}", "")
-    for i in range(1, 6)
+    for i in range(1, 4)
 ]
 
 
@@ -80,7 +80,7 @@ async def init_db(pool):
 
         await con.execute(schema)
 
-        for account_no in range(1, 6):
+        for account_no in range(1, 4):
 
             await con.execute(
                 """
