@@ -319,13 +319,13 @@ async def main():
         api_hash=API_HASH,
         sequential_updates=True,
     )
-        await client.start()
-        me = await client.get_me()
-        log.info("Account %s connected: %s (%s)", i, me.first_name, me.id)
-        clients.append(client)
+    await client.start()
+    me = await client.get_me()
+    log.info("Account %s connected: %s (%s)", i, me.first_name, me.id)
+    clients.append(client)
 
 
-    await enqueue_history(pool, clients)
+await enqueue_history(pool, clients)
 
     tasks = []
     for i, client in enumerate(clients, start=1):
