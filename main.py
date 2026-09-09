@@ -303,15 +303,15 @@ async def main():
 
     clients = []
     for i, session in enumerate(SESSION_STRINGS, start=1):
-    if not session.strip():
-        raise RuntimeError(f"SESSION_{i} is empty")
+        if not session.strip():
+            raise RuntimeError(f"SESSION_{i} is empty")
 
-    try:
-        session_obj = StringSession(session.strip())
-    except ValueError:
-        raise RuntimeError(
-            f"SESSION_{i} is NOT a valid Telethon StringSession"
-        )
+        try:
+            session_obj = StringSession(session.strip())
+        except ValueError:
+            raise RuntimeError(
+                f"SESSION_{i} is NOT a valid Telethon StringSession"
+            )
 
     client = TelegramClient(
         session_obj,
