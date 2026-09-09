@@ -303,18 +303,22 @@ async def main():
 
     clients = []
     for i, session in enumerate(SESSION_STRINGS, start=1):
-        if not session.strip():
-            raise RuntimeError(
-                f"SESSION_{i} is empty. Put your existing Telethon session "
-                f"string in .env."
-            )
+    if not session.strip():
+        raise RuntimeError(f"SESSION_{i} is empty")
 
-        client = TelegramClient(
-            StringSession(session),
-            api_id=API_ID,
-            api_hash=API_HASH,
-            sequential_updates=True,
+    try:
+        session_obj = StringSession(session.strip())
+    except ValueError:
+        raise RuntimeError(
+            f"SESSION_{i} is NOT a valid Telethon StringSession"
         )
+
+    client = TelegramClient(
+        session_obj,
+        api_id=API_ID,
+        api_hash=API_HASH,
+        sequential_updates=True,
+    )
         await client.start()
         me = await client.get_me()
         log.info("Account %s connected: %s (%s)", i, me.first_name, me.id)
