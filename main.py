@@ -22,17 +22,24 @@ DESTINATION = os.environ["DESTINATION_CHANNEL"].strip()
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# EXACTLY 3 TELEGRAM ACCOUNTS
+# ============================================================
+# EXACTLY 5 TELEGRAM ACCOUNTS
+# ============================================================
+
 SESSION_STRINGS = [
     os.getenv("SESSION_1", "").strip(),
     os.getenv("SESSION_2", "").strip(),
     os.getenv("SESSION_3", "").strip(),
+    os.getenv("SESSION_4", "").strip(),
+    os.getenv("SESSION_5", "").strip(),
 ]
 
-# ------------------------------------------------------------
-# WORKER SETTINGS
-# ------------------------------------------------------------
 
+# ============================================================
+# WORKER SETTINGS
+# ============================================================
+
+# 1 worker per account = 5 total workers
 WORKERS_PER_ACCOUNT = int(
     os.getenv("WORKERS_PER_ACCOUNT", "1")
 )
@@ -45,17 +52,15 @@ SCAN_BATCH_SIZE = int(
     os.getenv("SCAN_BATCH_SIZE", "500")
 )
 
-# If a worker dies while a job is "processing",
-# this amount of time must pass before another worker
-# can recover the job.
+# Processing lease.
+# If Render crashes while a message is processing,
+# another worker can recover it after this period.
 PROCESSING_LEASE_SECONDS = int(
     os.getenv("PROCESSING_LEASE_SECONDS", "1800")
 )
 
-# Number of REAL forwarding failures before a job becomes failed.
-#
-# IMPORTANT:
-# FloodWait does NOT count toward this number.
+# Real forwarding/API failures before marking failed.
+# FloodWait does NOT consume retries.
 MAX_RETRIES = int(
     os.getenv("MAX_RETRIES", "5")
 )
@@ -68,17 +73,15 @@ POLL_SECONDS = int(
     os.getenv("POLL_SECONDS", "15")
 )
 
-# Small delay between successful forwards from the same worker.
+# Delay between successful forwards by one worker.
 FORWARD_DELAY_SECONDS = float(
     os.getenv("FORWARD_DELAY_SECONDS", "0.2")
 )
 
-# How frequently to print history scanner progress.
 SCAN_LOG_EVERY = int(
     os.getenv("SCAN_LOG_EVERY", "500")
 )
 
-# Worker heartbeat/progress logging.
 WORKER_LOG_EVERY = int(
     os.getenv("WORKER_LOG_EVERY", "25")
 )
@@ -97,7 +100,7 @@ logger = logging.getLogger("telegram-forwarder")
 
 
 # ============================================================
-# GLOBAL SHUTDOWN
+# SHUTDOWN
 # ============================================================
 
 shutdown_event = asyncio.Event()
@@ -121,22 +124,22 @@ def validate_config():
 
     if not SOURCE:
         raise RuntimeError(
-            "SOURCE_CHANNEL is empty"
+            "SOURCE_CHANNEL is empty."
         )
 
     if not DESTINATION:
         raise RuntimeError(
-            "DESTINATION_CHANNEL is empty"
+            "DESTINATION_CHANNEL is empty."
         )
 
     if not DATABASE_URL:
         raise RuntimeError(
-            "DATABASE_URL is empty"
+            "DATABASE_URL is empty."
         )
 
-    if len(SESSION_STRINGS) != 3:
+    if len(SESSION_STRINGS) != 5:
         raise RuntimeError(
-            "Exactly 3 sessions are required."
+            "Exactly 5 sessions are required."
         )
 
     for account_no, session in enumerate(
@@ -170,25 +173,21 @@ async def resolve_entity(
     label,
 ):
     """
-    Resolve Telegram channel/group/user.
+    Resolve Telegram entity.
 
     Supports:
 
         @username
         username
-        t.me/username
-        numeric Telegram ID
+        https://t.me/username
+        numeric Telegram channel ID
 
-    Numeric IDs are also searched through the account's dialogs.
+    For numeric IDs, dialogs are searched as a fallback.
     """
 
     value = str(value).strip()
 
     normalized = value
-
-    # --------------------------------------------------------
-    # Normalize Telegram URLs
-    # --------------------------------------------------------
 
     prefixes = [
         "https://t.me/",
@@ -238,10 +237,11 @@ async def resolve_entity(
         )
 
     # --------------------------------------------------------
-    # Numeric ID
+    # Numeric Telegram ID
     # --------------------------------------------------------
 
     try:
+
         target_id = int(normalized)
 
     except (ValueError, TypeError):
@@ -298,7 +298,7 @@ async def resolve_entity(
         )
 
     # --------------------------------------------------------
-    # Final attempt
+    # Final resolution attempt
     # --------------------------------------------------------
 
     try:
@@ -320,13 +320,12 @@ async def resolve_entity(
     raise RuntimeError(
         f"Could not resolve {label} '{value}'. "
         f"This Telegram account must have access to "
-        f"the channel/group. Make sure it appears in "
-        f"this account's Telegram dialogs."
+        f"the channel/group."
     )
 
 
 # ============================================================
-# DATABASE INITIALIZATION
+# DATABASE
 # ============================================================
 
 async def init_db(pool):
@@ -339,11 +338,6 @@ async def init_db(pool):
 
         status TEXT NOT NULL DEFAULT 'pending',
 
-        /*
-         * REAL forwarding/API failures.
-         *
-         * FloodWait does NOT increase this.
-         */
         attempts INTEGER NOT NULL DEFAULT 0,
 
         processing_by TEXT,
@@ -384,6 +378,10 @@ async def init_db(pool):
 
         await conn.execute(schema)
 
+        # ====================================================
+        # FIVE ACCOUNTS
+        # ====================================================
+
         for account_no in range(1, 6):
 
             await conn.execute(
@@ -422,10 +420,15 @@ async def reset_stale_jobs(pool):
             UPDATE messages
             SET
                 status = 'pending',
+
                 processing_by = NULL,
+
                 processing_started_at = NULL,
+
                 updated_at = NOW()
+
             WHERE status = 'processing'
+
               AND processing_started_at <
                   NOW() - (
                       $1 * INTERVAL '1 second'
@@ -457,10 +460,15 @@ async def stale_job_recovery_loop(pool):
                     UPDATE messages
                     SET
                         status = 'pending',
+
                         processing_by = NULL,
+
                         processing_started_at = NULL,
+
                         updated_at = NOW()
+
                     WHERE status = 'processing'
+
                       AND processing_started_at <
                           NOW() - (
                               $1 * INTERVAL '1 second'
@@ -511,6 +519,7 @@ async def get_scan_start_id(pool):
                 MAX(source_message_id),
                 0
             ) AS max_id
+
             FROM messages
             """
         )
@@ -532,10 +541,12 @@ async def insert_message_batch(
     if not message_ids:
         return 0
 
-    rows = [
-        (int(message_id),)
-        for message_id in message_ids
-    ]
+    clean_ids = list(
+        dict.fromkeys(
+            int(x)
+            for x in message_ids
+        )
+    )
 
     async with pool.acquire() as conn:
 
@@ -549,24 +560,24 @@ async def insert_message_batch(
                 updated_at
             )
             SELECT
-                x.source_message_id,
+                x,
                 'pending',
                 0,
                 NOW(),
                 NOW()
-            FROM UNNEST($1::BIGINT[]) AS x(
-                source_message_id
-            )
+
+            FROM UNNEST(
+                $1::BIGINT[]
+            ) AS x
+
             ON CONFLICT (
                 source_message_id
             )
             DO NOTHING
             """,
-            [row[0] for row in rows],
+            clean_ids,
         )
 
-    # asyncpg returns something like:
-    # INSERT 0 500
     try:
 
         inserted_count = int(
@@ -597,12 +608,15 @@ async def enqueue_history(
     total_seen = 0
     total_inserted = 0
 
-    max_existing_id = await get_scan_start_id(
-        pool
+    max_existing_id = (
+        await get_scan_start_id(
+            pool
+        )
     )
 
     logger.info(
-        "Current database maximum source message ID: %s",
+        "Current database maximum "
+        "source message ID: %s",
         max_existing_id,
     )
 
@@ -657,7 +671,7 @@ async def enqueue_history(
                     )
 
         # ----------------------------------------------------
-        # Flush remaining batch
+        # Flush remaining IDs
         # ----------------------------------------------------
 
         if (
@@ -679,7 +693,8 @@ async def enqueue_history(
     except errors.FloodWaitError as exc:
 
         logger.warning(
-            "History scanner FloodWait: %s seconds.",
+            "History scanner FloodWait: "
+            "%s seconds.",
             exc.seconds,
         )
 
@@ -708,7 +723,7 @@ async def enqueue_history(
 
 
 # ============================================================
-# JOB CLAIMING
+# CLAIM JOB
 # ============================================================
 
 async def claim_job(
@@ -728,11 +743,17 @@ async def claim_job(
             row = await conn.fetchrow(
                 """
                 SELECT source_message_id
+
                 FROM messages
+
                 WHERE status = 'pending'
+
                   AND attempts < $1
+
                 ORDER BY source_message_id ASC
+
                 FOR UPDATE SKIP LOCKED
+
                 LIMIT 1
                 """,
                 MAX_RETRIES,
@@ -742,23 +763,15 @@ async def claim_job(
                 return None
 
             message_id = int(
-                row["source_message_id"]
+                row[
+                    "source_message_id"
+                ]
             )
-
-            # ------------------------------------------------
-            # IMPORTANT:
-            #
-            # We increment attempts when the worker actually
-            # claims the job.
-            #
-            # FloodWait will later restore this attempt,
-            # because FloodWait is a Telegram rate limit and
-            # not a real forwarding failure.
-            # ------------------------------------------------
 
             await conn.execute(
                 """
                 UPDATE messages
+
                 SET
                     status = 'processing',
 
@@ -780,7 +793,7 @@ async def claim_job(
 
 
 # ============================================================
-# JOB STATUS
+# MARK COMPLETED
 # ============================================================
 
 async def mark_completed(
@@ -793,6 +806,7 @@ async def mark_completed(
         await conn.execute(
             """
             UPDATE messages
+
             SET
                 status = 'completed',
 
@@ -812,6 +826,10 @@ async def mark_completed(
         )
 
 
+# ============================================================
+# NORMAL RETRY
+# ============================================================
+
 async def mark_retry(
     pool,
     message_id,
@@ -819,11 +837,12 @@ async def mark_retry(
 ):
 
     """
-    Normal failed attempt.
+    Used for REAL forwarding errors.
 
-    The attempt has already been incremented by claim_job.
+    attempts has already been incremented.
 
-    If attempts reach MAX_RETRIES, mark failed.
+    When attempts reaches MAX_RETRIES,
+    the job becomes failed.
     """
 
     async with pool.acquire() as conn:
@@ -831,11 +850,15 @@ async def mark_retry(
         await conn.execute(
             """
             UPDATE messages
+
             SET
                 status = CASE
+
                     WHEN attempts >= $2
                     THEN 'failed'
+
                     ELSE 'pending'
+
                 END,
 
                 processing_by = NULL,
@@ -854,6 +877,10 @@ async def mark_retry(
         )
 
 
+# ============================================================
+# FLOODWAIT RETURN TO QUEUE
+# ============================================================
+
 async def mark_floodwait_pending(
     pool,
     message_id,
@@ -861,18 +888,13 @@ async def mark_floodwait_pending(
 ):
 
     """
-    FloodWait is NOT considered a real attempt.
+    FloodWait is NOT a real forwarding failure.
 
-    Restore the attempt consumed by claim_job.
+    Therefore:
 
-    Example:
+        attempts = attempts - 1
 
-        attempts = 1
-        FloodWait
-        attempts becomes 0 again
-
-    This means a temporary Telegram rate limit
-    does not eventually kill the job.
+    This returns the job to its previous retry state.
     """
 
     async with pool.acquire() as conn:
@@ -880,6 +902,7 @@ async def mark_floodwait_pending(
         await conn.execute(
             """
             UPDATE messages
+
             SET
                 status = 'pending',
 
@@ -903,35 +926,6 @@ async def mark_floodwait_pending(
         )
 
 
-async def mark_failed(
-    pool,
-    message_id,
-    error_message,
-):
-
-    async with pool.acquire() as conn:
-
-        await conn.execute(
-            """
-            UPDATE messages
-            SET
-                status = 'failed',
-
-                processing_by = NULL,
-
-                processing_started_at = NULL,
-
-                last_error = $2,
-
-                updated_at = NOW()
-
-            WHERE source_message_id = $1
-            """,
-            message_id,
-            error_message,
-        )
-
-
 # ============================================================
 # ACCOUNT COOLDOWN
 # ============================================================
@@ -948,6 +942,7 @@ async def set_cooldown(
         await conn.execute(
             """
             UPDATE account_state
+
             SET
                 cooldown_until =
                     NOW()
@@ -977,6 +972,7 @@ async def clear_cooldown(
         await conn.execute(
             """
             UPDATE account_state
+
             SET
                 cooldown_until = NULL,
 
@@ -1000,7 +996,9 @@ async def get_cooldown(
         row = await conn.fetchrow(
             """
             SELECT cooldown_until
+
             FROM account_state
+
             WHERE account_no = $1
             """,
             account_no,
@@ -1038,15 +1036,11 @@ async def wait_for_account_cooldown(
         return True
 
     logger.warning(
-        "Account %s is FloodWaited for "
-        "approximately %s seconds.",
+        "Account %s cooldown active: "
+        "%s seconds remaining.",
         account_no,
         remaining,
     )
-
-    # --------------------------------------------------------
-    # DO NOT hold a DB connection while sleeping.
-    # --------------------------------------------------------
 
     while remaining > 0:
 
@@ -1072,7 +1066,7 @@ async def wait_for_account_cooldown(
 
     logger.info(
         "Account %s cooldown finished. "
-        "Worker is resuming.",
+        "Worker resuming.",
         account_no,
     )
 
@@ -1091,21 +1085,20 @@ async def forward_message(
 ):
 
     """
-    Direct Telegram forward.
+    Direct Telegram forwarding.
 
-    No download.
-    No re-upload.
-
-    Telegram performs the forwarding.
+    IMPORTANT:
+    This produces Telegram's normal
+    'Forwarded from' attribution.
     """
 
-    result = await client.forward_messages(
+    return await client.forward_messages(
         entity=destination_entity,
+
         messages=message_id,
+
         from_peer=source_entity,
     )
-
-    return result
 
 
 # ============================================================
@@ -1135,14 +1128,9 @@ async def worker(
 
     while not shutdown_event.is_set():
 
-        # ----------------------------------------------------
-        # ACCOUNT-SPECIFIC COOLDOWN
-        #
-        # If Account 2 is FloodWaited,
-        # ONLY Account 2 waits.
-        #
-        # Account 1 and Account 3 continue.
-        # ----------------------------------------------------
+        # ====================================================
+        # ACCOUNT-SPECIFIC FLOODWAIT
+        # ====================================================
 
         ready = await wait_for_account_cooldown(
             pool,
@@ -1152,9 +1140,9 @@ async def worker(
         if not ready:
             break
 
-        # ----------------------------------------------------
-        # CLAIM NEXT JOB
-        # ----------------------------------------------------
+        # ====================================================
+        # CLAIM JOB
+        # ====================================================
 
         message_id = await claim_job(
             pool,
@@ -1164,7 +1152,6 @@ async def worker(
 
         if message_id is None:
 
-            # Nothing currently available.
             await asyncio.sleep(
                 min(
                     POLL_SECONDS,
@@ -1180,9 +1167,9 @@ async def worker(
             message_id,
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # FORWARD
-        # ----------------------------------------------------
+        # ====================================================
 
         try:
 
@@ -1193,12 +1180,6 @@ async def worker(
                 destination_entity,
             )
 
-            # ------------------------------------------------
-            # IMPORTANT:
-            # Mark completed immediately after Telegram
-            # successfully accepts the forward.
-            # ------------------------------------------------
-
             await mark_completed(
                 pool,
                 message_id,
@@ -1208,15 +1189,12 @@ async def worker(
 
             logger.info(
                 "%s completed source message %s "
-                "| worker_success=%s",
+                "| success=%s errors=%s",
                 worker_name,
                 message_id,
                 successful,
+                errors_count,
             )
-
-            # ------------------------------------------------
-            # Successful operation clears old account error.
-            # ------------------------------------------------
 
             await clear_cooldown(
                 pool,
@@ -1243,7 +1221,7 @@ async def worker(
             )
 
             logger.warning(
-                "%s received FloodWait: %s seconds "
+                "%s FloodWait: %s seconds "
                 "(%.1f minutes).",
                 worker_name,
                 seconds,
@@ -1251,9 +1229,7 @@ async def worker(
             )
 
             # -----------------------------------------------
-            # CRITICAL:
-            #
-            # FloodWait DOES NOT consume retry attempts.
+            # DO NOT consume retry.
             # -----------------------------------------------
 
             await mark_floodwait_pending(
@@ -1261,6 +1237,10 @@ async def worker(
                 message_id,
                 seconds,
             )
+
+            # -----------------------------------------------
+            # ONLY THIS ACCOUNT COOLS DOWN.
+            # -----------------------------------------------
 
             await set_cooldown(
                 pool,
@@ -1270,14 +1250,11 @@ async def worker(
             )
 
             logger.warning(
-                "%s paused. Other accounts remain available.",
+                "%s paused because of FloodWait. "
+                "Other accounts continue.",
                 worker_name,
             )
 
-            # Loop immediately.
-            #
-            # wait_for_account_cooldown() will perform
-            # account-specific waiting.
             continue
 
         # ====================================================
@@ -1338,7 +1315,7 @@ async def worker(
             )
 
         # ====================================================
-        # UNKNOWN ERROR
+        # OTHER ERROR
         # ====================================================
 
         except Exception as exc:
@@ -1365,18 +1342,18 @@ async def worker(
                 RETRY_DELAY_SECONDS
             )
 
-        # ----------------------------------------------------
-        # Periodic worker statistics
-        # ----------------------------------------------------
+        # ====================================================
+        # PERIODIC WORKER LOG
+        # ====================================================
 
         if (
-            successful % WORKER_LOG_EVERY == 0
-            and successful > 0
+            successful > 0
+            and successful % WORKER_LOG_EVERY == 0
         ):
 
             logger.info(
-                "%s heartbeat | successful=%s "
-                "| errors=%s",
+                "%s heartbeat | "
+                "successful=%s | errors=%s",
                 worker_name,
                 successful,
                 errors_count,
@@ -1411,8 +1388,11 @@ async def status_loop(pool):
                     SELECT
                         status,
                         COUNT(*) AS count
+
                     FROM messages
+
                     GROUP BY status
+
                     ORDER BY status
                     """
                 )
@@ -1427,9 +1407,13 @@ async def status_loop(pool):
                 oldest_pending = await conn.fetchval(
                     """
                     SELECT source_message_id
+
                     FROM messages
+
                     WHERE status = 'pending'
+
                     ORDER BY source_message_id ASC
+
                     LIMIT 1
                     """
                 )
@@ -1439,6 +1423,7 @@ async def status_loop(pool):
                     SELECT MAX(
                         source_message_id
                     )
+
                     FROM messages
                     """
                 )
@@ -1446,7 +1431,9 @@ async def status_loop(pool):
                 processing = await conn.fetchval(
                     """
                     SELECT COUNT(*)
+
                     FROM messages
+
                     WHERE status = 'processing'
                     """
                 )
@@ -1454,7 +1441,9 @@ async def status_loop(pool):
                 failed = await conn.fetchval(
                     """
                     SELECT COUNT(*)
+
                     FROM messages
+
                     WHERE status = 'failed'
                     """
                 )
@@ -1479,7 +1468,7 @@ async def status_loop(pool):
             )
 
             # ------------------------------------------------
-            # Account cooldown status
+            # SHOW ALL FIVE ACCOUNT COOLDOWNS
             # ------------------------------------------------
 
             for account_no in range(1, 6):
@@ -1534,6 +1523,7 @@ async def get_latest_stored_message_id(
                 MAX(source_message_id),
                 0
             )
+
             FROM messages
             """
         )
@@ -1573,7 +1563,9 @@ async def monitor_new_messages(
 
                 ids = [
                     int(message.id)
+
                     for message in messages
+
                     if message.id > latest_id
                 ]
 
@@ -1601,10 +1593,6 @@ async def monitor_new_messages(
                 POLL_SECONDS
             )
 
-        # ====================================================
-        # FLOODWAIT
-        # ====================================================
-
         except errors.FloodWaitError as exc:
 
             logger.warning(
@@ -1622,10 +1610,6 @@ async def monitor_new_messages(
 
             except asyncio.TimeoutError:
                 pass
-
-        # ====================================================
-        # OTHER ERROR
-        # ====================================================
 
         except Exception:
 
@@ -1649,7 +1633,7 @@ async def monitor_new_messages(
 
 
 # ============================================================
-# ACCOUNT CONNECTION
+# CONNECT ALL FIVE ACCOUNTS
 # ============================================================
 
 async def connect_accounts():
@@ -1668,7 +1652,9 @@ async def connect_accounts():
 
         client = TelegramClient(
             StringSession(session_string),
+
             API_ID,
+
             API_HASH,
 
             connection_retries=10,
@@ -1685,6 +1671,7 @@ async def connect_accounts():
         logger.info(
             "Account %s connected: %s",
             account_no,
+
             getattr(
                 me,
                 "first_name",
@@ -1736,7 +1723,7 @@ async def disconnect_clients(
 
 
 # ============================================================
-# SIGNAL HANDLING
+# SIGNAL HANDLERS
 # ============================================================
 
 def install_signal_handlers():
@@ -1779,7 +1766,11 @@ async def main():
     )
 
     logger.info(
-        "Starting Telegram 3-account forwarder..."
+        "Starting Telegram 5-account forwarder..."
+    )
+
+    logger.info(
+        "Accounts: 5"
     )
 
     logger.info(
@@ -1789,7 +1780,7 @@ async def main():
 
     logger.info(
         "Total workers: %s",
-        3 * WORKERS_PER_ACCOUNT,
+        5 * WORKERS_PER_ACCOUNT,
     )
 
     logger.info(
@@ -1811,7 +1802,7 @@ async def main():
 
         min_size=1,
 
-        max_size=10,
+        max_size=15,
 
         command_timeout=60,
     )
@@ -1835,19 +1826,20 @@ async def main():
         )
 
         # ====================================================
-        # TELEGRAM ACCOUNTS
+        # CONNECT FIVE ACCOUNTS
         # ====================================================
 
         clients = await connect_accounts()
 
-        if len(clients) != 3:
+        if len(clients) != 5:
 
             raise RuntimeError(
-                f"Expected 3 clients, got {len(clients)}"
+                f"Expected 5 clients, "
+                f"got {len(clients)}"
             )
 
         logger.info(
-            "All 3 Telegram accounts connected."
+            "All 5 Telegram accounts connected."
         )
 
         # ====================================================
@@ -1909,7 +1901,7 @@ async def main():
         )
 
         # ====================================================
-        # RESOLVE FOR EACH ACCOUNT
+        # RESOLVE SOURCE + DESTINATION FOR ALL 5
         # ====================================================
 
         account_entities = []
@@ -1960,11 +1952,11 @@ async def main():
 
         logger.info(
             "Source/destination entities resolved "
-            "for all 3 accounts."
+            "for all 5 accounts."
         )
 
         # ====================================================
-        # START FORWARDING WORKERS
+        # START FIVE ACCOUNT WORKERS
         # ====================================================
 
         worker_count = 0
@@ -1994,10 +1986,15 @@ async def main():
                 task = asyncio.create_task(
                     worker(
                         pool,
+
                         client,
+
                         account_no,
+
                         worker_id,
+
                         account_source,
+
                         account_destination,
                     ),
                     name=(
@@ -2015,7 +2012,7 @@ async def main():
         )
 
         # ====================================================
-        # STATUS
+        # STATUS LOOP
         # ====================================================
 
         tasks.append(
@@ -2052,7 +2049,7 @@ async def main():
         )
 
         # ====================================================
-        # HISTORICAL SCANNER
+        # HISTORY SCANNER
         # ====================================================
 
         history_task = asyncio.create_task(
@@ -2069,7 +2066,7 @@ async def main():
         )
 
         # ====================================================
-        # WAIT FOR HISTORY SCAN
+        # WAIT FOR HISTORY SCANNER
         # ====================================================
 
         await history_task
@@ -2079,100 +2076,153 @@ async def main():
         )
 
         # ====================================================
-        # KEEP APP RUNNING
+        # MAIN KEEP-ALIVE LOOP
         # ====================================================
 
         while not shutdown_event.is_set():
 
             # ------------------------------------------------
-            # Check if any critical task died unexpectedly.
+            # Detect critical task failures.
             # ------------------------------------------------
 
             for task in list(tasks):
 
-                if task.done():
+                if not task.done():
+                    continue
 
-                    task_name = task.get_name()
+                task_name = task.get_name()
 
-                    if task_name in {
-                        "status-loop",
-                        "stale-job-recovery",
-                        "new-message-monitor",
-                    }:
+                # --------------------------------------------
+                # Ignore completed history scanner.
+                # --------------------------------------------
 
-                        try:
-                            exception = task.exception()
+                if task_name == "history-scanner":
+                    continue
 
-                        except asyncio.CancelledError:
-                            exception = None
+                # --------------------------------------------
+                # Worker died unexpectedly.
+                # --------------------------------------------
 
-                        if exception:
+                if task_name.startswith(
+                    "worker-"
+                ):
 
-                            logger.error(
-                                "CRITICAL TASK %s stopped "
-                                "with exception: %s",
-                                task_name,
-                                exception,
+                    try:
+
+                        exception = task.exception()
+
+                    except (
+                        asyncio.CancelledError
+                    ):
+
+                        exception = None
+
+                    if exception:
+
+                        logger.error(
+                            "WORKER %s stopped "
+                            "unexpectedly: %s",
+                            task_name,
+                            exception,
+                        )
+
+                    continue
+
+                # --------------------------------------------
+                # Critical service died.
+                # --------------------------------------------
+
+                if task_name in {
+                    "status-loop",
+                    "stale-job-recovery",
+                    "new-message-monitor",
+                }:
+
+                    try:
+
+                        exception = task.exception()
+
+                    except (
+                        asyncio.CancelledError
+                    ):
+
+                        exception = None
+
+                    if exception:
+
+                        logger.error(
+                            "CRITICAL TASK %s stopped "
+                            "with exception: %s",
+                            task_name,
+                            exception,
+                        )
+
+                        # ------------------------------------
+                        # Restart status loop
+                        # ------------------------------------
+
+                        if task_name == "status-loop":
+
+                            new_task = (
+                                asyncio.create_task(
+                                    status_loop(pool),
+                                    name="status-loop",
+                                )
                             )
 
-                            # Recreate critical task.
-                            if (
-                                task_name
-                                == "status-loop"
-                            ):
+                            tasks.append(
+                                new_task
+                            )
 
-                                new_task = (
-                                    asyncio.create_task(
-                                        status_loop(pool),
-                                        name="status-loop",
-                                    )
+                        # ------------------------------------
+                        # Restart recovery
+                        # ------------------------------------
+
+                        elif (
+                            task_name
+                            == "stale-job-recovery"
+                        ):
+
+                            new_task = (
+                                asyncio.create_task(
+                                    stale_job_recovery_loop(
+                                        pool
+                                    ),
+                                    name=(
+                                        "stale-job-recovery"
+                                    ),
                                 )
+                            )
 
-                                tasks.append(
-                                    new_task
+                            tasks.append(
+                                new_task
+                            )
+
+                        # ------------------------------------
+                        # Restart new message monitor
+                        # ------------------------------------
+
+                        elif (
+                            task_name
+                            == "new-message-monitor"
+                        ):
+
+                            new_task = (
+                                asyncio.create_task(
+                                    monitor_new_messages(
+                                        pool,
+                                        clients[0],
+                                        source_entity,
+                                    ),
+                                    name=(
+                                        "new-message-monitor"
+                                    ),
                                 )
+                            )
 
-                            elif (
-                                task_name
-                                == "stale-job-recovery"
-                            ):
-
-                                new_task = (
-                                    asyncio.create_task(
-                                        stale_job_recovery_loop(
-                                            pool
-                                        ),
-                                        name=(
-                                            "stale-job-recovery"
-                                        ),
-                                    )
-                                )
-
-                                tasks.append(
-                                    new_task
-                                )
-
-                            elif (
-                                task_name
-                                == "new-message-monitor"
-                            ):
-
-                                new_task = (
-                                    asyncio.create_task(
-                                        monitor_new_messages(
-                                            pool,
-                                            clients[0],
-                                            source_entity,
-                                        ),
-                                        name=(
-                                            "new-message-monitor"
-                                        ),
-                                    )
-                                )
-
-                                tasks.append(
-                                    new_task
-                                )
+                            tasks.append(
+                                new_task
+                            )
 
             await asyncio.sleep(
                 1
@@ -2198,9 +2248,9 @@ async def main():
 
         shutdown_event.set()
 
-        # ----------------------------------------------------
-        # Cancel all tasks
-        # ----------------------------------------------------
+        # ====================================================
+        # CANCEL TASKS
+        # ====================================================
 
         for task in tasks:
 
@@ -2215,9 +2265,9 @@ async def main():
                 return_exceptions=True,
             )
 
-        # ----------------------------------------------------
-        # Disconnect Telegram
-        # ----------------------------------------------------
+        # ====================================================
+        # DISCONNECT ACCOUNTS
+        # ====================================================
 
         if clients:
 
@@ -2225,9 +2275,9 @@ async def main():
                 clients
             )
 
-        # ----------------------------------------------------
-        # Close PostgreSQL
-        # ----------------------------------------------------
+        # ====================================================
+        # CLOSE DATABASE
+        # ====================================================
 
         await pool.close()
 
