@@ -11,83 +11,6 @@ from telethon.sessions import StringSession
 
 
 # ============================================================
-# CONFIG
-# ============================================================
-
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-
-SOURCE = os.environ["SOURCE_CHANNEL"].strip()
-DESTINATION = os.environ["DESTINATION_CHANNEL"].strip()
-
-DATABASE_URL = os.environ["DATABASE_URL"]
-
-# ============================================================
-# EXACTLY 5 TELEGRAM ACCOUNTS
-# ============================================================
-
-SESSION_STRINGS = [
-    os.getenv("SESSION_1", "").strip(),
-    os.getenv("SESSION_2", "").strip(),
-    os.getenv("SESSION_3", "").strip(),
-    os.getenv("SESSION_4", "").strip(),
-    os.getenv("SESSION_5", "").strip(),
-]
-
-
-# ============================================================
-# WORKER SETTINGS
-# ============================================================
-
-# 1 worker per account = 5 total workers
-WORKERS_PER_ACCOUNT = int(
-    os.getenv("WORKERS_PER_ACCOUNT", "1")
-)
-
-QUEUE_BATCH_SIZE = int(
-    os.getenv("QUEUE_BATCH_SIZE", "500")
-)
-
-SCAN_BATCH_SIZE = int(
-    os.getenv("SCAN_BATCH_SIZE", "500")
-)
-
-# Processing lease.
-# If Render crashes while a message is processing,
-# another worker can recover it after this period.
-PROCESSING_LEASE_SECONDS = int(
-    os.getenv("PROCESSING_LEASE_SECONDS", "1800")
-)
-
-# Real forwarding/API failures before marking failed.
-# FloodWait does NOT consume retries.
-MAX_RETRIES = int(
-    os.getenv("MAX_RETRIES", "5")
-)
-
-RETRY_DELAY_SECONDS = int(
-    os.getenv("RETRY_DELAY_SECONDS", "10")
-)
-
-POLL_SECONDS = int(
-    os.getenv("POLL_SECONDS", "15")
-)
-
-# Delay between successful forwards by one worker.
-FORWARD_DELAY_SECONDS = float(
-    os.getenv("FORWARD_DELAY_SECONDS", "0.2")
-)
-
-SCAN_LOG_EVERY = int(
-    os.getenv("SCAN_LOG_EVERY", "500")
-)
-
-WORKER_LOG_EVERY = int(
-    os.getenv("WORKER_LOG_EVERY", "25")
-)
-
-
-# ============================================================
 # LOGGING
 # ============================================================
 
@@ -96,220 +19,128 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logger = logging.getLogger("telegram-forwarder")
+log = logging.getLogger("telegram-forwarder")
 
 
 # ============================================================
-# SHUTDOWN
+# ENVIRONMENT
 # ============================================================
+
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+
+SOURCE_CHANNEL = os.environ["SOURCE_CHANNEL"]
+DESTINATION_CHANNEL = os.environ["DESTINATION_CHANNEL"]
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+SESSION_STRINGS = [
+    os.environ.get("SESSION_1", "").strip(),
+    os.environ.get("SESSION_2", "").strip(),
+    os.environ.get("SESSION_3", "").strip(),
+    os.environ.get("SESSION_4", "").strip(),
+    os.environ.get("SESSION_5", "").strip(),
+]
+
+WORKERS_PER_ACCOUNT = int(os.getenv("WORKERS_PER_ACCOUNT", "1"))
+
+QUEUE_BATCH_SIZE = int(os.getenv("QUEUE_BATCH_SIZE", "500"))
+SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "500"))
+
+PROCESSING_LEASE_SECONDS = int(
+    os.getenv("PROCESSING_LEASE_SECONDS", "1800")
+)
+
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+RETRY_DELAY_SECONDS = int(os.getenv("RETRY_DELAY_SECONDS", "10"))
+
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "2"))
+FORWARD_DELAY_SECONDS = float(
+    os.getenv("FORWARD_DELAY_SECONDS", "0.2")
+)
+
+SCAN_LOG_EVERY = int(os.getenv("SCAN_LOG_EVERY", "500"))
+
+WORKER_RESTART_DELAY = int(
+    os.getenv("WORKER_RESTART_DELAY", "5")
+)
+
+TELEGRAM_RECONNECT_DELAY = int(
+    os.getenv("TELEGRAM_RECONNECT_DELAY", "5")
+)
+
+
+# ============================================================
+# GLOBALS
+# ============================================================
+
+pool = None
+clients = {}
+source_entities = {}
+destination_entities = {}
 
 shutdown_event = asyncio.Event()
 
 
-def request_shutdown():
-    if not shutdown_event.is_set():
-        logger.info("Shutdown requested...")
-        shutdown_event.set()
-
-
 # ============================================================
-# HELPERS
+# CONFIG VALIDATION
 # ============================================================
-
-def utcnow():
-    return datetime.now(timezone.utc)
-
 
 def validate_config():
+    if not SOURCE_CHANNEL:
+        raise RuntimeError("SOURCE_CHANNEL is empty")
 
-    if not SOURCE:
-        raise RuntimeError(
-            "SOURCE_CHANNEL is empty."
-        )
-
-    if not DESTINATION:
-        raise RuntimeError(
-            "DESTINATION_CHANNEL is empty."
-        )
+    if not DESTINATION_CHANNEL:
+        raise RuntimeError("DESTINATION_CHANNEL is empty")
 
     if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL is empty."
-        )
+        raise RuntimeError("DATABASE_URL is empty")
 
     if len(SESSION_STRINGS) != 5:
-        raise RuntimeError(
-            "Exactly 5 sessions are required."
-        )
+        raise RuntimeError("Exactly 5 sessions are required")
 
-    for account_no, session in enumerate(
-        SESSION_STRINGS,
-        start=1,
-    ):
-
+    for i, session in enumerate(SESSION_STRINGS, start=1):
         if not session:
-            raise RuntimeError(
-                f"SESSION_{account_no} is empty."
-            )
-
-        try:
-            StringSession(session)
-
-        except Exception as exc:
-
-            raise RuntimeError(
-                f"SESSION_{account_no} is NOT "
-                f"a valid Telethon StringSession."
-            ) from exc
+            raise RuntimeError(f"SESSION_{i} is empty")
 
 
 # ============================================================
-# TELEGRAM ENTITY RESOLUTION
+# ENTITY RESOLUTION
 # ============================================================
 
-async def resolve_entity(
-    client,
-    value,
-    label,
-):
+async def resolve_entity(client, value, label):
     """
-    Resolve Telegram entity.
-
-    Supports:
-
-        @username
-        username
-        https://t.me/username
-        numeric Telegram channel ID
-
-    For numeric IDs, dialogs are searched as a fallback.
+    Resolve channel username/link/numeric ID into a Telethon entity.
     """
 
     value = str(value).strip()
 
+    # Remove common Telegram URL prefixes
     normalized = value
 
-    prefixes = [
+    for prefix in (
         "https://t.me/",
         "http://t.me/",
         "https://telegram.me/",
         "http://telegram.me/",
-    ]
-
-    for prefix in prefixes:
-
+        "t.me/",
+        "telegram.me/",
+    ):
         if normalized.startswith(prefix):
-
-            normalized = normalized[
-                len(prefix):
-            ]
-
+            normalized = normalized[len(prefix):]
             break
 
     normalized = normalized.rstrip("/")
 
-    # --------------------------------------------------------
-    # Direct resolution
-    # --------------------------------------------------------
-
+    # Try direct resolution first
     try:
+        entity = await client.get_entity(normalized)
 
-        entity = await client.get_entity(
-            normalized
-        )
-
-        logger.info(
-            "%s resolved directly: %s",
+        log.info(
+            "%s resolved for account %s: %s",
             label,
-            getattr(entity, "title", None)
-            or getattr(entity, "username", None)
-            or getattr(entity, "id", None),
-        )
-
-        return entity
-
-    except Exception as exc:
-
-        logger.warning(
-            "%s direct resolution failed: %s",
-            label,
-            exc,
-        )
-
-    # --------------------------------------------------------
-    # Numeric Telegram ID
-    # --------------------------------------------------------
-
-    try:
-
-        target_id = int(normalized)
-
-    except (ValueError, TypeError):
-
-        raise RuntimeError(
-            f"Could not resolve {label} '{value}'. "
-            f"Check the username/link and make sure "
-            f"this account has access."
-        )
-
-    positive_target_id = abs(target_id)
-
-    logger.info(
-        "%s searching account dialogs for ID %s...",
-        label,
-        target_id,
-    )
-
-    try:
-
-        async for dialog in client.iter_dialogs():
-
-            entity = dialog.entity
-
-            entity_id = getattr(
-                entity,
-                "id",
-                None,
-            )
-
-            if entity_id is None:
-                continue
-
-            if (
-                entity_id == target_id
-                or entity_id == positive_target_id
-            ):
-
-                logger.info(
-                    "%s resolved from dialogs: %s",
-                    label,
-                    getattr(entity, "title", None)
-                    or getattr(entity, "username", None)
-                    or entity_id,
-                )
-
-                return entity
-
-    except Exception:
-
-        logger.exception(
-            "Error searching dialogs for %s",
-            label,
-        )
-
-    # --------------------------------------------------------
-    # Final resolution attempt
-    # --------------------------------------------------------
-
-    try:
-
-        entity = await client.get_entity(
-            target_id
-        )
-
-        logger.info(
-            "%s resolved after dialog search.",
-            label,
+            getattr(client, "_forwarder_account_no", "?"),
+            getattr(entity, "title", getattr(entity, "username", entity)),
         )
 
         return entity
@@ -317,408 +148,307 @@ async def resolve_entity(
     except Exception:
         pass
 
-    raise RuntimeError(
-        f"Could not resolve {label} '{value}'. "
-        f"This Telegram account must have access to "
-        f"the channel/group."
-    )
+    # Numeric Telegram ID
+    try:
+        target_id = int(normalized)
+
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+
+            if getattr(entity, "id", None) == abs(target_id):
+                log.info(
+                    "%s resolved from dialogs for account %s",
+                    label,
+                    getattr(client, "_forwarder_account_no", "?"),
+                )
+                return entity
+
+    except (ValueError, TypeError):
+        pass
+
+    # Final attempt
+    try:
+        target_id = int(normalized)
+        entity = await client.get_entity(target_id)
+
+        log.info(
+            "%s resolved by numeric ID for account %s",
+            label,
+            getattr(client, "_forwarder_account_no", "?"),
+        )
+
+        return entity
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Account {getattr(client, '_forwarder_account_no', '?')} "
+            f"cannot resolve {label}: {value!r}. "
+            f"Make sure this account has access to the channel. "
+            f"Error: {e}"
+        )
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-async def init_db(pool):
-
-    schema = """
-    CREATE TABLE IF NOT EXISTS messages (
-        id BIGSERIAL PRIMARY KEY,
-
-        source_message_id BIGINT NOT NULL UNIQUE,
-
-        status TEXT NOT NULL DEFAULT 'pending',
-
-        attempts INTEGER NOT NULL DEFAULT 0,
-
-        processing_by TEXT,
-
-        processing_started_at TIMESTAMPTZ,
-
-        completed_at TIMESTAMPTZ,
-
-        last_error TEXT,
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_messages_status
-        ON messages(status);
-
-    CREATE INDEX IF NOT EXISTS idx_messages_source_message_id
-        ON messages(source_message_id);
-
-    CREATE INDEX IF NOT EXISTS idx_messages_processing_started
-        ON messages(processing_started_at);
-
-
-    CREATE TABLE IF NOT EXISTS account_state (
-        account_no INTEGER PRIMARY KEY,
-
-        cooldown_until TIMESTAMPTZ,
-
-        last_error TEXT,
-
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """
+async def init_db():
+    global pool
 
     async with pool.acquire() as conn:
 
-        await conn.execute(schema)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id BIGSERIAL PRIMARY KEY,
+                source_message_id BIGINT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                processing_by TEXT,
+                processing_started_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ,
+                last_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
 
-        # ====================================================
-        # FIVE ACCOUNTS
-        # ====================================================
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_status
+            ON messages(status)
+            """
+        )
+
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_source_id
+            ON messages(source_message_id)
+            """
+        )
+
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_processing_started
+            ON messages(processing_started_at)
+            """
+        )
+
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_state (
+                account_no INTEGER PRIMARY KEY,
+                cooldown_until TIMESTAMPTZ,
+                last_error TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
 
         for account_no in range(1, 6):
-
             await conn.execute(
                 """
-                INSERT INTO account_state (
-                    account_no,
-                    cooldown_until,
-                    last_error
-                )
-                VALUES (
-                    $1,
-                    NULL,
-                    NULL
-                )
-                ON CONFLICT (account_no)
-                DO NOTHING
+                INSERT INTO account_state(account_no)
+                VALUES($1)
+                ON CONFLICT(account_no) DO NOTHING
                 """,
                 account_no,
             )
 
-    logger.info(
-        "Database initialized."
-    )
+    log.info("Database initialized")
+
+
+# ============================================================
+# DATABASE CONNECTION HEALTH
+# ============================================================
+
+async def db_health_check():
+    async with pool.acquire() as conn:
+        await conn.fetchval("SELECT 1")
 
 
 # ============================================================
 # STALE JOB RECOVERY
 # ============================================================
 
-async def reset_stale_jobs(pool):
-
+async def reset_stale_jobs():
     async with pool.acquire() as conn:
-
         result = await conn.execute(
             """
             UPDATE messages
             SET
                 status = 'pending',
-
                 processing_by = NULL,
-
                 processing_started_at = NULL,
-
                 updated_at = NOW()
-
             WHERE status = 'processing'
-
               AND processing_started_at <
-                  NOW() - (
-                      $1 * INTERVAL '1 second'
-                  )
+                  NOW() - ($1::INTEGER * INTERVAL '1 second')
             """,
             PROCESSING_LEASE_SECONDS,
         )
 
-    logger.info(
-        "Startup stale-job recovery: %s",
-        result,
-    )
+    log.info("Stale job recovery: %s", result)
 
 
-async def stale_job_recovery_loop(pool):
-
-    logger.info(
-        "Stale-job recovery loop started."
-    )
-
+async def stale_job_recovery_loop():
     while not shutdown_event.is_set():
-
         try:
+            await reset_stale_jobs()
 
-            async with pool.acquire() as conn:
-
-                result = await conn.execute(
-                    """
-                    UPDATE messages
-                    SET
-                        status = 'pending',
-
-                        processing_by = NULL,
-
-                        processing_started_at = NULL,
-
-                        updated_at = NOW()
-
-                    WHERE status = 'processing'
-
-                      AND processing_started_at <
-                          NOW() - (
-                              $1 * INTERVAL '1 second'
-                          )
-                    """,
-                    PROCESSING_LEASE_SECONDS,
-                )
-
-            if result != "UPDATE 0":
-
-                logger.warning(
-                    "Runtime stale-job recovery: %s",
-                    result,
-                )
-
-        except Exception:
-
-            logger.exception(
-                "Stale-job recovery error."
+        except Exception as e:
+            log.error(
+                "STALE RECOVERY error: %s",
+                e,
             )
 
         try:
-
             await asyncio.wait_for(
                 shutdown_event.wait(),
                 timeout=60,
             )
-
         except asyncio.TimeoutError:
             pass
 
-    logger.info(
-        "Stale-job recovery loop stopped."
-    )
-
 
 # ============================================================
-# DATABASE POSITION
+# QUEUE
 # ============================================================
 
-async def get_scan_start_id(pool):
+async def insert_message_batch(message_ids):
+    if not message_ids:
+        return 0
 
     async with pool.acquire() as conn:
-
-        row = await conn.fetchrow(
+        result = await conn.fetchval(
             """
-            SELECT COALESCE(
-                MAX(source_message_id),
-                0
-            ) AS max_id
-
-            FROM messages
-            """
+            INSERT INTO messages(source_message_id)
+            SELECT UNNEST($1::BIGINT[])
+            ON CONFLICT(source_message_id) DO NOTHING
+            RETURNING 1
+            """,
+            message_ids,
         )
 
-    return int(
-        row["max_id"]
-    )
+        # The above RETURNING only gives one row through fetchval.
+        # Use command below for accurate count.
+        await conn.execute(
+            """
+            INSERT INTO messages(source_message_id)
+            SELECT UNNEST($1::BIGINT[])
+            ON CONFLICT(source_message_id) DO NOTHING
+            """,
+            [],
+        )
+
+    return 0
 
 
-# ============================================================
-# INSERT MESSAGE BATCH
-# ============================================================
-
-async def insert_message_batch(
-    pool,
-    message_ids,
-):
+async def insert_message_ids(message_ids):
+    """
+    Correct bulk insertion with accurate inserted count.
+    """
 
     if not message_ids:
         return 0
 
-    clean_ids = list(
-        dict.fromkeys(
-            int(x)
-            for x in message_ids
-        )
-    )
-
     async with pool.acquire() as conn:
-
-        result = await conn.execute(
+        rows = await conn.fetch(
             """
-            INSERT INTO messages (
-                source_message_id,
-                status,
-                attempts,
-                created_at,
-                updated_at
-            )
-            SELECT
-                x,
-                'pending',
-                0,
-                NOW(),
-                NOW()
-
-            FROM UNNEST(
-                $1::BIGINT[]
-            ) AS x
-
-            ON CONFLICT (
-                source_message_id
-            )
-            DO NOTHING
+            INSERT INTO messages(source_message_id)
+            SELECT UNNEST($1::BIGINT[])
+            ON CONFLICT(source_message_id) DO NOTHING
+            RETURNING source_message_id
             """,
-            clean_ids,
+            message_ids,
         )
 
-    try:
+    return len(rows)
 
-        inserted_count = int(
-            result.split()[-1]
+
+async def get_latest_stored_message_id():
+    async with pool.acquire() as conn:
+        value = await conn.fetchval(
+            """
+            SELECT COALESCE(MAX(source_message_id), 0)
+            FROM messages
+            """
         )
 
-    except Exception:
+    return int(value or 0)
 
-        inserted_count = 0
 
-    return inserted_count
+async def get_scan_start_id():
+    return await get_latest_stored_message_id()
 
 
 # ============================================================
 # HISTORY SCANNER
 # ============================================================
 
-async def enqueue_history(
-    pool,
-    client,
-    source_entity,
-):
-
-    logger.info(
-        "Starting/resuming source history scan..."
+async def enqueue_history(account_no, client, source_entity):
+    log.info(
+        "A%d history scanner started",
+        account_no,
     )
 
-    total_seen = 0
-    total_inserted = 0
-
-    max_existing_id = (
-        await get_scan_start_id(
-            pool
-        )
-    )
-
-    logger.info(
-        "Current database maximum "
-        "source message ID: %s",
-        max_existing_id,
-    )
-
-    pending_batch = []
+    seen = 0
+    inserted = 0
 
     try:
-
-        logger.info(
-            "Beginning Telegram history iteration..."
-        )
-
         async for message in client.iter_messages(
             source_entity,
             reverse=True,
         ):
-
             if shutdown_event.is_set():
                 break
 
-            total_seen += 1
+            seen += 1
 
-            pending_batch.append(
-                int(message.id)
-            )
+            try:
+                added = await insert_message_ids(
+                    [message.id]
+                )
+                inserted += added
 
-            if len(
-                pending_batch
-            ) >= SCAN_BATCH_SIZE:
+            except Exception as e:
+                log.error(
+                    "History DB insert error at %s: %s",
+                    message.id,
+                    e,
+                )
+                await asyncio.sleep(2)
 
-                inserted = (
-                    await insert_message_batch(
-                        pool,
-                        pending_batch,
-                    )
+            if seen % SCAN_LOG_EVERY == 0:
+                log.info(
+                    "HISTORY A%d | seen=%s inserted=%s",
+                    account_no,
+                    seen,
+                    inserted,
                 )
 
-                total_inserted += inserted
-
-                pending_batch.clear()
-
-                if (
-                    total_seen
-                    % SCAN_LOG_EVERY
-                    == 0
-                ):
-
-                    logger.info(
-                        "History scan: "
-                        "seen=%s inserted=%s",
-                        total_seen,
-                        total_inserted,
-                    )
-
-        # ----------------------------------------------------
-        # Flush remaining IDs
-        # ----------------------------------------------------
-
-        if (
-            pending_batch
-            and not shutdown_event.is_set()
-        ):
-
-            inserted = (
-                await insert_message_batch(
-                    pool,
-                    pending_batch,
-                )
-            )
-
-            total_inserted += inserted
-
-            pending_batch.clear()
-
-    except errors.FloodWaitError as exc:
-
-        logger.warning(
-            "History scanner FloodWait: "
-            "%s seconds.",
-            exc.seconds,
+    except errors.FloodWaitError as e:
+        log.warning(
+            "HISTORY A%d FloodWait: %s seconds",
+            account_no,
+            e.seconds,
         )
 
-        try:
+        await asyncio.sleep(e.seconds)
 
-            await asyncio.wait_for(
-                shutdown_event.wait(),
-                timeout=exc.seconds,
-            )
-
-        except asyncio.TimeoutError:
-            pass
-
-    except Exception:
-
-        logger.exception(
-            "History scanner error."
+    except Exception as e:
+        log.error(
+            "HISTORY A%d error: %s",
+            account_no,
+            e,
         )
 
-    logger.info(
-        "History scan pass finished: "
-        "seen=%s inserted=%s",
-        total_seen,
-        total_inserted,
+    log.info(
+        "HISTORY A%d finished | seen=%s inserted=%s",
+        account_no,
+        seen,
+        inserted,
     )
 
 
@@ -726,34 +456,22 @@ async def enqueue_history(
 # CLAIM JOB
 # ============================================================
 
-async def claim_job(
-    pool,
-    account_no,
-    worker_id,
-):
-
-    worker_name = (
-        f"account-{account_no}-worker-{worker_id}"
-    )
-
+async def claim_job(worker_name):
     async with pool.acquire() as conn:
 
         async with conn.transaction():
 
             row = await conn.fetchrow(
                 """
-                SELECT source_message_id
-
+                SELECT
+                    id,
+                    source_message_id,
+                    attempts
                 FROM messages
-
                 WHERE status = 'pending'
-
                   AND attempts < $1
-
-                ORDER BY source_message_id ASC
-
+                ORDER BY source_message_id
                 FOR UPDATE SKIP LOCKED
-
                 LIMIT 1
                 """,
                 MAX_RETRIES,
@@ -762,167 +480,94 @@ async def claim_job(
             if not row:
                 return None
 
-            message_id = int(
-                row[
-                    "source_message_id"
-                ]
-            )
-
             await conn.execute(
                 """
                 UPDATE messages
-
                 SET
                     status = 'processing',
-
-                    attempts = attempts + 1,
-
                     processing_by = $1,
-
                     processing_started_at = NOW(),
-
+                    attempts = attempts + 1,
                     updated_at = NOW()
-
-                WHERE source_message_id = $2
+                WHERE id = $2
                 """,
                 worker_name,
-                message_id,
+                row["id"],
             )
 
-            return message_id
+            return {
+                "db_id": row["id"],
+                "source_message_id": row["source_message_id"],
+                "attempts": row["attempts"] + 1,
+            }
 
 
 # ============================================================
-# MARK COMPLETED
+# JOB STATUS
 # ============================================================
 
-async def mark_completed(
-    pool,
-    message_id,
-):
-
+async def mark_completed(db_id):
     async with pool.acquire() as conn:
-
         await conn.execute(
             """
             UPDATE messages
-
             SET
                 status = 'completed',
-
-                completed_at = NOW(),
-
                 processing_by = NULL,
-
                 processing_started_at = NULL,
-
-                last_error = NULL,
-
-                updated_at = NOW()
-
-            WHERE source_message_id = $1
+                completed_at = NOW(),
+                updated_at = NOW(),
+                last_error = NULL
+            WHERE id = $1
             """,
-            message_id,
+            db_id,
         )
 
 
-# ============================================================
-# NORMAL RETRY
-# ============================================================
-
-async def mark_retry(
-    pool,
-    message_id,
-    error_message,
-):
-
-    """
-    Used for REAL forwarding errors.
-
-    attempts has already been incremented.
-
-    When attempts reaches MAX_RETRIES,
-    the job becomes failed.
-    """
+async def mark_retry(db_id, error_text, attempts):
+    new_status = (
+        "failed"
+        if attempts >= MAX_RETRIES
+        else "pending"
+    )
 
     async with pool.acquire() as conn:
-
         await conn.execute(
             """
             UPDATE messages
-
             SET
-                status = CASE
-
-                    WHEN attempts >= $2
-                    THEN 'failed'
-
-                    ELSE 'pending'
-
-                END,
-
+                status = $2,
                 processing_by = NULL,
-
                 processing_started_at = NULL,
-
                 last_error = $3,
-
                 updated_at = NOW()
-
-            WHERE source_message_id = $1
+            WHERE id = $1
             """,
-            message_id,
-            MAX_RETRIES,
-            error_message,
+            db_id,
+            new_status,
+            error_text[:4000],
         )
 
-
-# ============================================================
-# FLOODWAIT RETURN TO QUEUE
-# ============================================================
 
 async def mark_floodwait_pending(
-    pool,
-    message_id,
-    seconds,
+    db_id,
+    error_text,
 ):
-
-    """
-    FloodWait is NOT a real forwarding failure.
-
-    Therefore:
-
-        attempts = attempts - 1
-
-    This returns the job to its previous retry state.
-    """
-
     async with pool.acquire() as conn:
-
         await conn.execute(
             """
             UPDATE messages
-
             SET
                 status = 'pending',
-
-                attempts = GREATEST(
-                    attempts - 1,
-                    0
-                ),
-
+                attempts = GREATEST(attempts - 1, 0),
                 processing_by = NULL,
-
                 processing_started_at = NULL,
-
                 last_error = $2,
-
                 updated_at = NOW()
-
-            WHERE source_message_id = $1
+            WHERE id = $1
             """,
-            message_id,
-            f"FloodWait {seconds}s",
+            db_id,
+            error_text[:4000],
         )
 
 
@@ -930,470 +575,593 @@ async def mark_floodwait_pending(
 # ACCOUNT COOLDOWN
 # ============================================================
 
-async def set_cooldown(
-    pool,
-    account_no,
-    seconds,
-    error_message,
-):
+async def set_cooldown(account_no, seconds, error_text):
+    cooldown_until = datetime.now(timezone.utc)
+
+    from datetime import timedelta
+
+    cooldown_until += timedelta(seconds=seconds)
 
     async with pool.acquire() as conn:
-
         await conn.execute(
             """
             UPDATE account_state
-
             SET
-                cooldown_until =
-                    NOW()
-                    + (
-                        $2 * INTERVAL '1 second'
-                    ),
-
+                cooldown_until = $2,
                 last_error = $3,
-
                 updated_at = NOW()
-
             WHERE account_no = $1
             """,
             account_no,
-            seconds,
-            error_message,
+            cooldown_until,
+            error_text[:4000],
         )
 
+    log.warning(
+        "A%d cooldown set for %s seconds",
+        account_no,
+        seconds,
+    )
 
-async def clear_cooldown(
-    pool,
-    account_no,
-):
 
+async def clear_cooldown(account_no):
     async with pool.acquire() as conn:
-
         await conn.execute(
             """
             UPDATE account_state
-
             SET
                 cooldown_until = NULL,
-
                 last_error = NULL,
-
                 updated_at = NOW()
-
             WHERE account_no = $1
             """,
             account_no,
         )
 
 
-async def get_cooldown(
-    pool,
-    account_no,
-):
-
+async def get_cooldown(account_no):
     async with pool.acquire() as conn:
-
-        row = await conn.fetchrow(
+        value = await conn.fetchval(
             """
             SELECT cooldown_until
-
             FROM account_state
-
             WHERE account_no = $1
             """,
             account_no,
         )
 
-    if (
-        not row
-        or row["cooldown_until"] is None
-    ):
-
-        return 0
-
-    remaining = (
-        row["cooldown_until"]
-        - utcnow()
-    ).total_seconds()
-
-    return max(
-        0,
-        int(remaining),
-    )
+    return value
 
 
-async def wait_for_account_cooldown(
-    pool,
-    account_no,
-):
+async def wait_for_account_cooldown(account_no):
+    while not shutdown_event.is_set():
 
-    remaining = await get_cooldown(
-        pool,
-        account_no,
-    )
+        cooldown = await get_cooldown(account_no)
 
-    if remaining <= 0:
-        return True
+        if cooldown is None:
+            return
 
-    logger.warning(
-        "Account %s cooldown active: "
-        "%s seconds remaining.",
-        account_no,
-        remaining,
-    )
+        now = datetime.now(timezone.utc)
 
-    while remaining > 0:
+        remaining = (
+            cooldown - now
+        ).total_seconds()
 
-        if shutdown_event.is_set():
-            return False
+        if remaining <= 0:
+            await clear_cooldown(account_no)
+            return
 
-        await asyncio.sleep(
-            min(
-                remaining,
-                10,
-            )
-        )
-
-        remaining = await get_cooldown(
-            pool,
+        log.info(
+            "A%d waiting for FloodWait cooldown: %.0f seconds",
             account_no,
+            remaining,
         )
 
-    await clear_cooldown(
-        pool,
-        account_no,
-    )
-
-    logger.info(
-        "Account %s cooldown finished. "
-        "Worker resuming.",
-        account_no,
-    )
-
-    return True
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(),
+                timeout=min(remaining, 30),
+            )
+        except asyncio.TimeoutError:
+            pass
 
 
 # ============================================================
-# DIRECT FORWARD
+# FORWARD
 # ============================================================
 
 async def forward_message(
     client,
-    message_id,
     source_entity,
     destination_entity,
+    message_id,
 ):
-
-    """
-    Direct Telegram forwarding.
-
-    IMPORTANT:
-    This produces Telegram's normal
-    'Forwarded from' attribution.
-    """
-
     return await client.forward_messages(
         entity=destination_entity,
-
         messages=message_id,
-
         from_peer=source_entity,
     )
+
+
+# ============================================================
+# TELEGRAM CONNECTION
+# ============================================================
+
+async def ensure_client_connected(account_no, client):
+    """
+    Make absolutely sure the Telegram client is connected.
+    """
+
+    if client.is_connected():
+        return True
+
+    log.warning(
+        "A%d Telegram client is disconnected. Reconnecting...",
+        account_no,
+    )
+
+    try:
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            raise RuntimeError(
+                f"A{account_no} session is no longer authorized"
+            )
+
+        log.info(
+            "A%d Telegram reconnect successful",
+            account_no,
+        )
+
+        return True
+
+    except Exception as e:
+        log.error(
+            "A%d Telegram reconnect failed: %s",
+            account_no,
+            e,
+        )
+
+        return False
+
+
+async def reconnect_client(account_no, client):
+    """
+    Force a clean reconnect.
+    """
+
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+    await asyncio.sleep(TELEGRAM_RECONNECT_DELAY)
+
+    try:
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            raise RuntimeError(
+                f"A{account_no} session is unauthorized"
+            )
+
+        log.info(
+            "A%d reconnected successfully",
+            account_no,
+        )
+
+        # Re-resolve entities after reconnect.
+        source_entities[account_no] = await resolve_entity(
+            client,
+            SOURCE_CHANNEL,
+            "SOURCE_CHANNEL",
+        )
+
+        destination_entities[account_no] = await resolve_entity(
+            client,
+            DESTINATION_CHANNEL,
+            "DESTINATION_CHANNEL",
+        )
+
+        return True
+
+    except Exception as e:
+        log.error(
+            "A%d reconnect failed: %s",
+            account_no,
+            e,
+        )
+        return False
 
 
 # ============================================================
 # WORKER
 # ============================================================
 
-async def worker(
-    pool,
-    client,
+async def worker_once(
     account_no,
-    worker_id,
-    source_entity,
-    destination_entity,
+    worker_index,
 ):
+    worker_name = f"worker-{account_no}-{worker_index}"
 
-    worker_name = (
-        f"A{account_no}-W{worker_id}"
-    )
-
-    logger.info(
-        "%s started.",
-        worker_name,
-    )
+    client = clients[account_no]
 
     successful = 0
     errors_count = 0
 
     while not shutdown_event.is_set():
 
-        # ====================================================
-        # ACCOUNT-SPECIFIC FLOODWAIT
-        # ====================================================
+        # ----------------------------------------------------
+        # Ensure Telegram connection
+        # ----------------------------------------------------
 
-        ready = await wait_for_account_cooldown(
-            pool,
+        if not await ensure_client_connected(
             account_no,
-        )
+            client,
+        ):
+            await asyncio.sleep(
+                TELEGRAM_RECONNECT_DELAY
+            )
+            continue
 
-        if not ready:
+        # ----------------------------------------------------
+        # Respect only this account's cooldown
+        # ----------------------------------------------------
+
+        await wait_for_account_cooldown(account_no)
+
+        if shutdown_event.is_set():
             break
 
-        # ====================================================
-        # CLAIM JOB
-        # ====================================================
+        # ----------------------------------------------------
+        # Claim job
+        # ----------------------------------------------------
 
-        message_id = await claim_job(
-            pool,
-            account_no,
-            worker_id,
-        )
+        try:
+            job = await claim_job(worker_name)
 
-        if message_id is None:
+        except (
+            asyncpg.PostgresConnectionError,
+            asyncpg.InterfaceError,
+            ConnectionError,
+        ) as e:
 
-            await asyncio.sleep(
-                min(
-                    POLL_SECONDS,
-                    5,
-                )
+            log.error(
+                "A%d %s PostgreSQL connection problem: %s",
+                account_no,
+                worker_name,
+                e,
             )
+
+            await asyncio.sleep(3)
+            continue
+
+        except Exception as e:
+
+            log.error(
+                "A%d %s claim error: %s",
+                account_no,
+                worker_name,
+                e,
+            )
+
+            await asyncio.sleep(2)
+            continue
+
+        if not job:
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(),
+                    timeout=POLL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
 
             continue
 
-        logger.info(
-            "%s forwarding source message %s",
-            worker_name,
+        message_id = job["source_message_id"]
+
+        log.info(
+            "A%d-W%d forwarding source message %s",
+            account_no,
+            worker_index,
             message_id,
         )
 
-        # ====================================================
-        # FORWARD
-        # ====================================================
+        # ----------------------------------------------------
+        # Forward
+        # ----------------------------------------------------
 
         try:
 
+            source_entity = source_entities[account_no]
+            destination_entity = destination_entities[
+                account_no
+            ]
+
             await forward_message(
                 client,
-                message_id,
                 source_entity,
                 destination_entity,
-            )
-
-            await mark_completed(
-                pool,
                 message_id,
             )
+
+            await mark_completed(job["db_id"])
 
             successful += 1
 
-            logger.info(
-                "%s completed source message %s "
-                "| success=%s errors=%s",
-                worker_name,
+            log.info(
+                "A%d-W%d completed source message %s | "
+                "success=%s errors=%s",
+                account_no,
+                worker_index,
                 message_id,
                 successful,
                 errors_count,
             )
 
-            await clear_cooldown(
-                pool,
-                account_no,
-            )
+            await clear_cooldown(account_no)
 
-            if (
-                FORWARD_DELAY_SECONDS
-                > 0
-            ):
-
+            if FORWARD_DELAY_SECONDS > 0:
                 await asyncio.sleep(
                     FORWARD_DELAY_SECONDS
                 )
 
-        # ====================================================
-        # FLOODWAIT
-        # ====================================================
+        # ----------------------------------------------------
+        # FloodWait
+        # ----------------------------------------------------
 
-        except errors.FloodWaitError as exc:
+        except errors.FloodWaitError as e:
 
-            seconds = int(
-                exc.seconds
-            )
+            errors_count += 1
 
-            logger.warning(
-                "%s FloodWait: %s seconds "
-                "(%.1f minutes).",
-                worker_name,
-                seconds,
-                seconds / 60,
-            )
-
-            # -----------------------------------------------
-            # DO NOT consume retry.
-            # -----------------------------------------------
-
-            await mark_floodwait_pending(
-                pool,
+            log.warning(
+                "A%d-W%d FloodWait %s seconds on message %s",
+                account_no,
+                worker_index,
+                e.seconds,
                 message_id,
-                seconds,
             )
 
-            # -----------------------------------------------
-            # ONLY THIS ACCOUNT COOLS DOWN.
-            # -----------------------------------------------
+            # FloodWait MUST NOT consume a retry.
+            try:
+                await mark_floodwait_pending(
+                    job["db_id"],
+                    f"FloodWait: {e.seconds} seconds",
+                )
+            except Exception as db_error:
+                log.error(
+                    "A%d failed to return FloodWait job "
+                    "to queue: %s",
+                    account_no,
+                    db_error,
+                )
 
             await set_cooldown(
-                pool,
                 account_no,
-                seconds,
-                f"FloodWait {seconds}s",
-            )
-
-            logger.warning(
-                "%s paused because of FloodWait. "
-                "Other accounts continue.",
-                worker_name,
+                e.seconds,
+                f"FloodWait: {e.seconds}s",
             )
 
             continue
 
-        # ====================================================
-        # RPC ERROR
-        # ====================================================
+        # ----------------------------------------------------
+        # Connection closed
+        # ----------------------------------------------------
 
-        except errors.RPCError as exc:
+        except (
+            ConnectionError,
+            asyncio.TimeoutError,
+            OSError,
+        ) as e:
 
             errors_count += 1
 
-            error_message = (
-                f"{type(exc).__name__}: {exc}"
+            error_text = str(e)
+
+            log.error(
+                "A%d-W%d connection error on message %s: %s",
+                account_no,
+                worker_index,
+                message_id,
+                error_text,
             )
 
-            logger.warning(
-                "%s RPC error for message %s: %s",
-                worker_name,
-                message_id,
-                error_message,
+            # Return job to pending so another worker
+            # can process it if necessary.
+            try:
+                await mark_retry(
+                    job["db_id"],
+                    error_text,
+                    job["attempts"],
+                )
+            except Exception as db_error:
+                log.error(
+                    "A%d job recovery DB error: %s",
+                    account_no,
+                    db_error,
+                )
+
+            # Reconnect this account only.
+            await reconnect_client(
+                account_no,
+                client,
             )
 
-            await mark_retry(
-                pool,
-                message_id,
-                error_message,
+            await asyncio.sleep(2)
+
+        # ----------------------------------------------------
+        # Telegram RPC errors
+        # ----------------------------------------------------
+
+        except errors.RPCError as e:
+
+            errors_count += 1
+
+            error_text = (
+                f"{type(e).__name__}: {e}"
             )
+
+            log.error(
+                "A%d-W%d Telegram RPC error on %s: %s",
+                account_no,
+                worker_index,
+                message_id,
+                error_text,
+            )
+
+            try:
+                await mark_retry(
+                    job["db_id"],
+                    error_text,
+                    job["attempts"],
+                )
+            except Exception as db_error:
+                log.error(
+                    "A%d retry DB error: %s",
+                    account_no,
+                    db_error,
+                )
 
             await asyncio.sleep(
                 RETRY_DELAY_SECONDS
             )
 
-        # ====================================================
-        # TIMEOUT
-        # ====================================================
+        # ----------------------------------------------------
+        # Any other exception
+        # ----------------------------------------------------
 
-        except asyncio.TimeoutError:
+        except Exception as e:
 
             errors_count += 1
 
-            error_message = (
-                "Telegram request timeout"
+            error_text = (
+                f"{type(e).__name__}: {e}"
             )
 
-            logger.warning(
-                "%s timeout for message %s",
-                worker_name,
+            log.exception(
+                "A%d-W%d unexpected error on %s",
+                account_no,
+                worker_index,
                 message_id,
             )
 
-            await mark_retry(
-                pool,
-                message_id,
-                error_message,
-            )
+            try:
+                await mark_retry(
+                    job["db_id"],
+                    error_text,
+                    job["attempts"],
+                )
+            except Exception as db_error:
+                log.error(
+                    "A%d retry DB error: %s",
+                    account_no,
+                    db_error,
+                )
 
             await asyncio.sleep(
                 RETRY_DELAY_SECONDS
             )
-
-        # ====================================================
-        # OTHER ERROR
-        # ====================================================
-
-        except Exception as exc:
-
-            errors_count += 1
-
-            error_message = (
-                f"{type(exc).__name__}: {exc}"
-            )
-
-            logger.exception(
-                "%s unexpected error for message %s",
-                worker_name,
-                message_id,
-            )
-
-            await mark_retry(
-                pool,
-                message_id,
-                error_message,
-            )
-
-            await asyncio.sleep(
-                RETRY_DELAY_SECONDS
-            )
-
-        # ====================================================
-        # PERIODIC WORKER LOG
-        # ====================================================
-
-        if (
-            successful > 0
-            and successful % WORKER_LOG_EVERY == 0
-        ):
-
-            logger.info(
-                "%s heartbeat | "
-                "successful=%s | errors=%s",
-                worker_name,
-                successful,
-                errors_count,
-            )
-
-    logger.info(
-        "%s stopped | successful=%s | errors=%s",
-        worker_name,
-        successful,
-        errors_count,
-    )
 
 
 # ============================================================
-# STATUS LOOP
+# PERMANENT WORKER SUPERVISOR
 # ============================================================
 
-async def status_loop(pool):
+async def worker_supervisor(
+    account_no,
+    worker_index,
+):
+    """
+    VERY IMPORTANT:
 
-    logger.info(
-        "Status loop started."
+    This supervisor never permanently dies.
+
+    If worker_once() crashes because of a connection
+    problem or an unexpected exception, it starts it again.
+    """
+
+    worker_name = (
+        f"worker-{account_no}-{worker_index}"
     )
+
+    restart_count = 0
 
     while not shutdown_event.is_set():
 
         try:
 
+            log.info(
+                "STARTING %s",
+                worker_name,
+            )
+
+            await worker_once(
+                account_no,
+                worker_index,
+            )
+
+            if shutdown_event.is_set():
+                break
+
+            restart_count += 1
+
+            log.warning(
+                "WORKER %s exited. "
+                "Automatic restart #%s in %s seconds",
+                worker_name,
+                restart_count,
+                WORKER_RESTART_DELAY,
+            )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
+
+            restart_count += 1
+
+            log.exception(
+                "WORKER %s crashed: %s",
+                worker_name,
+                e,
+            )
+
+            log.warning(
+                "WORKER %s automatic restart #%s",
+                worker_name,
+                restart_count,
+            )
+
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(),
+                timeout=WORKER_RESTART_DELAY,
+            )
+        except asyncio.TimeoutError:
+            pass
+
+    log.info(
+        "WORKER SUPERVISOR %s stopped",
+        worker_name,
+    )
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+async def status_loop():
+    while not shutdown_event.is_set():
+
+        try:
             async with pool.acquire() as conn:
 
                 counts = await conn.fetch(
                     """
-                    SELECT
-                        status,
-                        COUNT(*) AS count
-
+                    SELECT status, COUNT(*) AS count
                     FROM messages
-
                     GROUP BY status
-
-                    ORDER BY status
                     """
                 )
 
@@ -1406,151 +1174,131 @@ async def status_loop(pool):
 
                 oldest_pending = await conn.fetchval(
                     """
-                    SELECT source_message_id
-
+                    SELECT MIN(source_message_id)
                     FROM messages
-
                     WHERE status = 'pending'
-
-                    ORDER BY source_message_id ASC
-
-                    LIMIT 1
                     """
                 )
 
                 newest = await conn.fetchval(
                     """
-                    SELECT MAX(
-                        source_message_id
-                    )
-
+                    SELECT MAX(source_message_id)
                     FROM messages
                     """
                 )
 
-                processing = await conn.fetchval(
-                    """
-                    SELECT COUNT(*)
-
-                    FROM messages
-
-                    WHERE status = 'processing'
-                    """
-                )
-
-                failed = await conn.fetchval(
-                    """
-                    SELECT COUNT(*)
-
-                    FROM messages
-
-                    WHERE status = 'failed'
-                    """
-                )
-
-            parts = [
-                f"{row['status']}={row['count']}"
+            count_map = {
+                row["status"]: row["count"]
                 for row in counts
-            ]
+            }
 
-            logger.info(
-                "STATUS total=%s | %s "
-                "| processing=%s "
-                "| failed=%s "
-                "| oldest_pending=%s "
-                "| newest=%s",
-                total,
-                " ".join(parts),
-                processing,
-                failed,
-                oldest_pending,
-                newest,
+            completed = count_map.get(
+                "completed",
+                0,
             )
 
-            # ------------------------------------------------
-            # SHOW ALL FIVE ACCOUNT COOLDOWNS
-            # ------------------------------------------------
+            failed = count_map.get(
+                "failed",
+                0,
+            )
+
+            pending = count_map.get(
+                "pending",
+                0,
+            )
+
+            processing = count_map.get(
+                "processing",
+                0,
+            )
+
+            cooldowns = []
 
             for account_no in range(1, 6):
 
                 cooldown = await get_cooldown(
-                    pool,
-                    account_no,
+                    account_no
                 )
 
-                if cooldown > 0:
+                if cooldown:
+                    remaining = (
+                        cooldown
+                        - datetime.now(timezone.utc)
+                    ).total_seconds()
 
-                    logger.info(
-                        "ACCOUNT %s cooldown=%ss",
-                        account_no,
-                        cooldown,
+                    if remaining > 0:
+                        cooldowns.append(
+                            f"A{account_no}={remaining:.0f}s"
+                        )
+                    else:
+                        cooldowns.append(
+                            f"A{account_no}=ready"
+                        )
+                else:
+                    cooldowns.append(
+                        f"A{account_no}=ready"
                     )
 
-        except Exception:
+            log.info(
+                "STATUS total=%s | completed=%s "
+                "failed=%s pending=%s processing=%s | "
+                "oldest_pending=%s newest=%s | %s",
+                total,
+                completed,
+                failed,
+                pending,
+                processing,
+                oldest_pending,
+                newest,
+                " ".join(cooldowns),
+            )
 
-            logger.exception(
-                "Status loop error."
+        except Exception as e:
+            log.error(
+                "STATUS error: %s",
+                e,
             )
 
         try:
-
             await asyncio.wait_for(
                 shutdown_event.wait(),
-                timeout=60,
+                timeout=30,
             )
-
         except asyncio.TimeoutError:
             pass
-
-    logger.info(
-        "Status loop stopped."
-    )
 
 
 # ============================================================
 # NEW MESSAGE MONITOR
 # ============================================================
 
-async def get_latest_stored_message_id(
-    pool,
-):
-
-    async with pool.acquire() as conn:
-
-        value = await conn.fetchval(
-            """
-            SELECT COALESCE(
-                MAX(source_message_id),
-                0
-            )
-
-            FROM messages
-            """
-        )
-
-    return int(
-        value or 0
-    )
-
-
 async def monitor_new_messages(
-    pool,
-    client,
-    source_entity,
+    account_no,
 ):
+    client = clients[account_no]
 
-    logger.info(
-        "New-message monitor started."
+    log.info(
+        "A%d new-message monitor started",
+        account_no,
     )
 
     while not shutdown_event.is_set():
 
         try:
 
+            if not await ensure_client_connected(
+                account_no,
+                client,
+            ):
+                await asyncio.sleep(5)
+                continue
+
+            source_entity = source_entities[
+                account_no
+            ]
+
             latest_id = (
-                await get_latest_stored_message_id(
-                    pool
-                )
+                await get_latest_stored_message_id()
             )
 
             messages = await client.get_messages(
@@ -1562,193 +1310,202 @@ async def monitor_new_messages(
             if messages:
 
                 ids = [
-                    int(message.id)
-
+                    message.id
                     for message in messages
-
                     if message.id > latest_id
                 ]
 
                 if ids:
-
-                    ids = list(
-                        dict.fromkeys(ids)
+                    added = await insert_message_ids(
+                        ids
                     )
 
-                    inserted = (
-                        await insert_message_batch(
-                            pool,
-                            ids,
-                        )
-                    )
-
-                    logger.info(
-                        "New-message monitor: "
-                        "detected=%s queued=%s",
+                    log.info(
+                        "A%d NEW messages detected=%s "
+                        "inserted=%s",
+                        account_no,
                         len(ids),
-                        inserted,
+                        added,
                     )
 
-            await asyncio.sleep(
-                POLL_SECONDS
+            await asyncio.sleep(10)
+
+        except errors.FloodWaitError as e:
+
+            log.warning(
+                "A%d NEW monitor FloodWait=%s seconds",
+                account_no,
+                e.seconds,
             )
 
-        except errors.FloodWaitError as exc:
+            await asyncio.sleep(e.seconds)
 
-            logger.warning(
-                "New-message monitor FloodWait: "
-                "%s seconds.",
-                exc.seconds,
+        except (
+            ConnectionError,
+            asyncio.TimeoutError,
+            OSError,
+        ) as e:
+
+            log.error(
+                "A%d NEW monitor connection error: %s",
+                account_no,
+                e,
             )
 
-            try:
-
-                await asyncio.wait_for(
-                    shutdown_event.wait(),
-                    timeout=exc.seconds,
-                )
-
-            except asyncio.TimeoutError:
-                pass
-
-        except Exception:
-
-            logger.exception(
-                "New-message monitor error."
+            await reconnect_client(
+                account_no,
+                client,
             )
 
-            try:
+            await asyncio.sleep(5)
 
-                await asyncio.wait_for(
-                    shutdown_event.wait(),
-                    timeout=POLL_SECONDS,
-                )
+        except Exception as e:
 
-            except asyncio.TimeoutError:
-                pass
+            log.error(
+                "A%d NEW monitor error: %s",
+                account_no,
+                e,
+            )
 
-    logger.info(
-        "New-message monitor stopped."
-    )
+            await asyncio.sleep(10)
 
 
 # ============================================================
-# CONNECT ALL FIVE ACCOUNTS
+# CONNECT ACCOUNTS
 # ============================================================
 
 async def connect_accounts():
-
-    clients = []
 
     for account_no, session_string in enumerate(
         SESSION_STRINGS,
         start=1,
     ):
 
-        logger.info(
-            "Connecting account %s...",
+        client = TelegramClient(
+            StringSession(session_string),
+            API_ID,
+            API_HASH,
+            connection_retries=20,
+            retry_delay=5,
+            auto_reconnect=True,
+            request_retries=5,
+        )
+
+        client._forwarder_account_no = account_no
+
+        clients[account_no] = client
+
+    # Connect sequentially so all sessions don't
+    # hammer Telegram at exactly the same moment.
+
+    for account_no in range(1, 6):
+
+        client = clients[account_no]
+
+        log.info(
+            "Connecting Telegram account %d...",
             account_no,
         )
 
-        client = TelegramClient(
-            StringSession(session_string),
+        await client.connect()
 
-            API_ID,
-
-            API_HASH,
-
-            connection_retries=10,
-
-            retry_delay=5,
-
-            auto_reconnect=True,
-        )
-
-        await client.start()
+        if not await client.is_user_authorized():
+            raise RuntimeError(
+                f"SESSION_{account_no} is not authorized"
+            )
 
         me = await client.get_me()
 
-        logger.info(
-            "Account %s connected: %s",
+        log.info(
+            "A%d connected | Telegram ID=%s | username=%s",
             account_no,
-
-            getattr(
-                me,
-                "first_name",
-                None,
-            )
-            or getattr(
-                me,
-                "username",
-                None,
-            )
-            or me.id,
+            getattr(me, "id", "?"),
+            getattr(me, "username", None),
         )
 
-        clients.append(
-            client
+        await asyncio.sleep(1)
+
+
+# ============================================================
+# RESOLVE ALL ENTITIES
+# ============================================================
+
+async def resolve_all_entities():
+
+    for account_no in range(1, 6):
+
+        client = clients[account_no]
+
+        source_entities[account_no] = (
+            await resolve_entity(
+                client,
+                SOURCE_CHANNEL,
+                "SOURCE_CHANNEL",
+            )
         )
 
-    return clients
-
-
-# ============================================================
-# DISCONNECT
-# ============================================================
-
-async def disconnect_clients(
-    clients,
-):
-
-    for account_no, client in enumerate(
-        clients,
-        start=1,
-    ):
-
-        try:
-
-            logger.info(
-                "Disconnecting account %s...",
-                account_no,
+        destination_entities[account_no] = (
+            await resolve_entity(
+                client,
+                DESTINATION_CHANNEL,
+                "DESTINATION_CHANNEL",
             )
+        )
 
-            await client.disconnect()
-
-        except Exception:
-
-            logger.exception(
-                "Error disconnecting account %s",
-                account_no,
-            )
+        log.info(
+            "A%d source/destination ready",
+            account_no,
+        )
 
 
 # ============================================================
-# SIGNAL HANDLERS
+# ACCOUNT HEALTH MONITOR
 # ============================================================
 
-def install_signal_handlers():
+async def account_health_loop():
 
-    try:
+    while not shutdown_event.is_set():
 
-        loop = asyncio.get_running_loop()
+        for account_no in range(1, 6):
 
-        for sig in (
-            signal.SIGTERM,
-            signal.SIGINT,
-        ):
+            if shutdown_event.is_set():
+                break
 
-            with suppress(
-                NotImplementedError
-            ):
+            client = clients.get(account_no)
 
-                loop.add_signal_handler(
-                    sig,
-                    request_shutdown,
+            if not client:
+                continue
+
+            try:
+
+                if not client.is_connected():
+
+                    log.warning(
+                        "HEALTH A%d is disconnected. "
+                        "Reconnecting...",
+                        account_no,
+                    )
+
+                    await reconnect_client(
+                        account_no,
+                        client,
+                    )
+
+            except Exception as e:
+
+                log.error(
+                    "HEALTH A%d error: %s",
+                    account_no,
+                    e,
                 )
 
-    except Exception:
-
-        pass
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(),
+                timeout=20,
+            )
+        except asyncio.TimeoutError:
+            pass
 
 
 # ============================================================
@@ -1757,533 +1514,188 @@ def install_signal_handlers():
 
 async def main():
 
-    install_signal_handlers()
+    global pool
 
     validate_config()
 
-    logger.info(
-        "================================================"
+    log.info(
+        "Starting 5-account Telegram forwarder"
     )
 
-    logger.info(
-        "Starting Telegram 5-account forwarder..."
-    )
-
-    logger.info(
-        "Accounts: 5"
-    )
-
-    logger.info(
-        "Workers per account: %s",
-        WORKERS_PER_ACCOUNT,
-    )
-
-    logger.info(
-        "Total workers: %s",
-        5 * WORKERS_PER_ACCOUNT,
-    )
-
-    logger.info(
-        "MAX_RETRIES: %s",
-        MAX_RETRIES,
-    )
-
-    logger.info(
-        "PROCESSING_LEASE_SECONDS: %s",
-        PROCESSING_LEASE_SECONDS,
-    )
-
-    logger.info(
-        "================================================"
-    )
+    # --------------------------------------------------------
+    # PostgreSQL
+    # --------------------------------------------------------
 
     pool = await asyncpg.create_pool(
         DATABASE_URL,
-
-        min_size=1,
-
-        max_size=15,
-
+        min_size=2,
+        max_size=20,
         command_timeout=60,
+        max_inactive_connection_lifetime=60,
     )
 
-    clients = []
+    await init_db()
+
+    await reset_stale_jobs()
+
+    # --------------------------------------------------------
+    # Telegram
+    # --------------------------------------------------------
+
+    await connect_accounts()
+
+    await resolve_all_entities()
+
+    # --------------------------------------------------------
+    # Background tasks
+    # --------------------------------------------------------
 
     tasks = []
 
-    try:
+    # Five forwarding supervisors
+    for account_no in range(1, 6):
 
-        # ====================================================
-        # DATABASE
-        # ====================================================
-
-        await init_db(
-            pool
-        )
-
-        await reset_stale_jobs(
-            pool
-        )
-
-        # ====================================================
-        # CONNECT FIVE ACCOUNTS
-        # ====================================================
-
-        clients = await connect_accounts()
-
-        if len(clients) != 5:
-
-            raise RuntimeError(
-                f"Expected 5 clients, "
-                f"got {len(clients)}"
-            )
-
-        logger.info(
-            "All 5 Telegram accounts connected."
-        )
-
-        # ====================================================
-        # RESOLVE ACCOUNT 1
-        # ====================================================
-
-        logger.info(
-            "Resolving Telegram source/destination..."
-        )
-
-        source_entity = await resolve_entity(
-            clients[0],
-            SOURCE,
-            "SOURCE_CHANNEL",
-        )
-
-        destination_entity = await resolve_entity(
-            clients[0],
-            DESTINATION,
-            "DESTINATION_CHANNEL",
-        )
-
-        logger.info(
-            "SOURCE resolved successfully: %s",
-            getattr(
-                source_entity,
-                "title",
-                None,
-            )
-            or getattr(
-                source_entity,
-                "username",
-                None,
-            )
-            or getattr(
-                source_entity,
-                "id",
-                None,
-            ),
-        )
-
-        logger.info(
-            "DESTINATION resolved successfully: %s",
-            getattr(
-                destination_entity,
-                "title",
-                None,
-            )
-            or getattr(
-                destination_entity,
-                "username",
-                None,
-            )
-            or getattr(
-                destination_entity,
-                "id",
-                None,
-            ),
-        )
-
-        # ====================================================
-        # RESOLVE SOURCE + DESTINATION FOR ALL 5
-        # ====================================================
-
-        account_entities = []
-
-        for account_index, client in enumerate(
-            clients
+        for worker_index in range(
+            1,
+            WORKERS_PER_ACCOUNT + 1,
         ):
 
-            account_no = (
-                account_index + 1
-            )
-
-            if account_no == 1:
-
-                account_entities.append(
-                    (
-                        source_entity,
-                        destination_entity,
-                    )
-                )
-
-                continue
-
-            logger.info(
-                "Resolving source/destination "
-                "for account %s...",
-                account_no,
-            )
-
-            account_source = await resolve_entity(
-                client,
-                SOURCE,
-                f"ACCOUNT_{account_no}_SOURCE",
-            )
-
-            account_destination = await resolve_entity(
-                client,
-                DESTINATION,
-                f"ACCOUNT_{account_no}_DESTINATION",
-            )
-
-            account_entities.append(
-                (
-                    account_source,
-                    account_destination,
-                )
-            )
-
-        logger.info(
-            "Source/destination entities resolved "
-            "for all 5 accounts."
-        )
-
-        # ====================================================
-        # START FIVE ACCOUNT WORKERS
-        # ====================================================
-
-        worker_count = 0
-
-        for account_index, client in enumerate(
-            clients
-        ):
-
-            account_no = (
-                account_index + 1
-            )
-
-            (
-                account_source,
-                account_destination,
-            ) = account_entities[
-                account_index
-            ]
-
-            for worker_id in range(
-                1,
-                WORKERS_PER_ACCOUNT + 1,
-            ):
-
-                worker_count += 1
-
-                task = asyncio.create_task(
-                    worker(
-                        pool,
-
-                        client,
-
+            tasks.append(
+                asyncio.create_task(
+                    worker_supervisor(
                         account_no,
-
-                        worker_id,
-
-                        account_source,
-
-                        account_destination,
+                        worker_index,
                     ),
                     name=(
-                        f"worker-{account_no}-{worker_id}"
+                        f"worker-supervisor-"
+                        f"{account_no}-{worker_index}"
                     ),
                 )
-
-                tasks.append(
-                    task
-                )
-
-        logger.info(
-            "Started %s forwarding workers.",
-            worker_count,
-        )
-
-        # ====================================================
-        # STATUS LOOP
-        # ====================================================
-
-        tasks.append(
-            asyncio.create_task(
-                status_loop(pool),
-                name="status-loop",
-            )
-        )
-
-        # ====================================================
-        # STALE JOB RECOVERY
-        # ====================================================
-
-        tasks.append(
-            asyncio.create_task(
-                stale_job_recovery_loop(pool),
-                name="stale-job-recovery",
-            )
-        )
-
-        # ====================================================
-        # NEW MESSAGE MONITOR
-        # ====================================================
-
-        tasks.append(
-            asyncio.create_task(
-                monitor_new_messages(
-                    pool,
-                    clients[0],
-                    source_entity,
-                ),
-                name="new-message-monitor",
-            )
-        )
-
-        # ====================================================
-        # HISTORY SCANNER
-        # ====================================================
-
-        history_task = asyncio.create_task(
-            enqueue_history(
-                pool,
-                clients[0],
-                source_entity,
-            ),
-            name="history-scanner",
-        )
-
-        tasks.append(
-            history_task
-        )
-
-        # ====================================================
-        # WAIT FOR HISTORY SCANNER
-        # ====================================================
-
-        await history_task
-
-        logger.info(
-            "Historical scan task completed."
-        )
-
-        # ====================================================
-        # MAIN KEEP-ALIVE LOOP
-        # ====================================================
-
-        while not shutdown_event.is_set():
-
-            # ------------------------------------------------
-            # Detect critical task failures.
-            # ------------------------------------------------
-
-            for task in list(tasks):
-
-                if not task.done():
-                    continue
-
-                task_name = task.get_name()
-
-                # --------------------------------------------
-                # Ignore completed history scanner.
-                # --------------------------------------------
-
-                if task_name == "history-scanner":
-                    continue
-
-                # --------------------------------------------
-                # Worker died unexpectedly.
-                # --------------------------------------------
-
-                if task_name.startswith(
-                    "worker-"
-                ):
-
-                    try:
-
-                        exception = task.exception()
-
-                    except (
-                        asyncio.CancelledError
-                    ):
-
-                        exception = None
-
-                    if exception:
-
-                        logger.error(
-                            "WORKER %s stopped "
-                            "unexpectedly: %s",
-                            task_name,
-                            exception,
-                        )
-
-                    continue
-
-                # --------------------------------------------
-                # Critical service died.
-                # --------------------------------------------
-
-                if task_name in {
-                    "status-loop",
-                    "stale-job-recovery",
-                    "new-message-monitor",
-                }:
-
-                    try:
-
-                        exception = task.exception()
-
-                    except (
-                        asyncio.CancelledError
-                    ):
-
-                        exception = None
-
-                    if exception:
-
-                        logger.error(
-                            "CRITICAL TASK %s stopped "
-                            "with exception: %s",
-                            task_name,
-                            exception,
-                        )
-
-                        # ------------------------------------
-                        # Restart status loop
-                        # ------------------------------------
-
-                        if task_name == "status-loop":
-
-                            new_task = (
-                                asyncio.create_task(
-                                    status_loop(pool),
-                                    name="status-loop",
-                                )
-                            )
-
-                            tasks.append(
-                                new_task
-                            )
-
-                        # ------------------------------------
-                        # Restart recovery
-                        # ------------------------------------
-
-                        elif (
-                            task_name
-                            == "stale-job-recovery"
-                        ):
-
-                            new_task = (
-                                asyncio.create_task(
-                                    stale_job_recovery_loop(
-                                        pool
-                                    ),
-                                    name=(
-                                        "stale-job-recovery"
-                                    ),
-                                )
-                            )
-
-                            tasks.append(
-                                new_task
-                            )
-
-                        # ------------------------------------
-                        # Restart new message monitor
-                        # ------------------------------------
-
-                        elif (
-                            task_name
-                            == "new-message-monitor"
-                        ):
-
-                            new_task = (
-                                asyncio.create_task(
-                                    monitor_new_messages(
-                                        pool,
-                                        clients[0],
-                                        source_entity,
-                                    ),
-                                    name=(
-                                        "new-message-monitor"
-                                    ),
-                                )
-                            )
-
-                            tasks.append(
-                                new_task
-                            )
-
-            await asyncio.sleep(
-                1
             )
 
-    except asyncio.CancelledError:
-
-        logger.info(
-            "Main task cancelled."
+    # Status
+    tasks.append(
+        asyncio.create_task(
+            status_loop(),
+            name="status",
         )
+    )
 
-    except Exception:
-
-        logger.exception(
-            "Fatal application error."
+    # Stale job recovery
+    tasks.append(
+        asyncio.create_task(
+            stale_job_recovery_loop(),
+            name="stale-recovery",
         )
+    )
+
+    # Account health
+    tasks.append(
+        asyncio.create_task(
+            account_health_loop(),
+            name="account-health",
+        )
+    )
+
+    # New message monitor
+    # Only one monitor is necessary.
+    tasks.append(
+        asyncio.create_task(
+            monitor_new_messages(1),
+            name="new-message-monitor",
+        )
+    )
+
+    # --------------------------------------------------------
+    # History scan
+    # --------------------------------------------------------
+
+    # Use A1 for the historical scan.
+    # The other four accounts remain available for forwarding.
+
+    history_task = asyncio.create_task(
+        enqueue_history(
+            1,
+            clients[1],
+            source_entities[1],
+        ),
+        name="history-scanner",
+    )
+
+    tasks.append(history_task)
+
+    log.info(
+        "ALL SERVICES STARTED"
+    )
+
+    log.info(
+        "Forwarding workers: %d",
+        5 * WORKERS_PER_ACCOUNT,
+    )
+
+    # --------------------------------------------------------
+    # Wait forever until shutdown
+    # --------------------------------------------------------
+
+    try:
+
+        await shutdown_event.wait()
 
     finally:
 
-        logger.info(
-            "Stopping application..."
+        log.info(
+            "Shutdown requested"
         )
-
-        shutdown_event.set()
-
-        # ====================================================
-        # CANCEL TASKS
-        # ====================================================
 
         for task in tasks:
 
             if not task.done():
-
                 task.cancel()
 
-        if tasks:
+        with suppress(Exception):
 
             await asyncio.gather(
                 *tasks,
                 return_exceptions=True,
             )
 
-        # ====================================================
-        # DISCONNECT ACCOUNTS
-        # ====================================================
+        # Disconnect Telegram
+        for account_no, client in clients.items():
 
-        if clients:
+            try:
+                await client.disconnect()
 
-            await disconnect_clients(
-                clients
-            )
+                log.info(
+                    "A%d disconnected",
+                    account_no,
+                )
 
-        # ====================================================
-        # CLOSE DATABASE
-        # ====================================================
+            except Exception:
+                pass
 
-        await pool.close()
+        # Close DB
+        if pool:
 
-        logger.info(
-            "Application stopped."
+            await pool.close()
+
+        log.info(
+            "Shutdown complete"
         )
+
+
+# ============================================================
+# SIGNAL HANDLERS
+# ============================================================
+
+def request_shutdown():
+
+    if not shutdown_event.is_set():
+
+        log.info(
+            "Shutdown signal received"
+        )
+
+        shutdown_event.set()
 
 
 # ============================================================
@@ -2292,14 +1704,35 @@ async def main():
 
 if __name__ == "__main__":
 
+    loop = asyncio.new_event_loop()
+
+    asyncio.set_event_loop(loop)
+
+    for sig in (
+        signal.SIGINT,
+        signal.SIGTERM,
+    ):
+        with suppress(NotImplementedError):
+            loop.add_signal_handler(
+                sig,
+                request_shutdown,
+            )
+
     try:
 
-        asyncio.run(
+        loop.run_until_complete(
             main()
         )
 
     except KeyboardInterrupt:
 
-        logger.info(
-            "Stopped by keyboard interrupt."
-        )
+        request_shutdown()
+
+    finally:
+
+        with suppress(Exception):
+            loop.run_until_complete(
+                asyncio.sleep(0)
+            )
+
+        loop.close()
